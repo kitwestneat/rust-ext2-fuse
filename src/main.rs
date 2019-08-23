@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read,Seek, SeekFrom};
 use std::ffi::OsStr;
 use std::str::from_utf8;
-use libc::{c_int, ENOENT, EIO};
+use libc::{c_int, ENOENT, EIO, ENOTDIR};
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
 use time::Timespec;
 
@@ -13,6 +13,45 @@ macro_rules! offset_of {
         unsafe { &(*(0 as *const $ty)).$field as *const _ as usize }
     }
 }
+
+macro_rules! load_obj {
+    ($dev:expr, $ty:ty, $addr:expr) => {{
+        let mut buf = [0; size_of::<$ty>()];
+        $dev.seek(SeekFrom::Start($addr)).map_err(|_| EIO)?;
+        $dev.read_exact(&mut buf).map_err(|_| EIO)?;
+
+        let obj = unsafe {
+            std::mem::transmute::<[u8; size_of::<$ty>()], $ty>(buf)
+        };
+
+        Ok(obj)
+    }}
+}
+
+macro_rules! try_option {
+    ($e:expr,$reply:ident,$err:ident) => {
+        match $e {
+            Some(v) => v,
+            None => {
+                $reply.error($err);
+                return;
+            }
+        }
+    }
+}
+macro_rules! try_error {
+    ($e:expr, $reply: ident) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => {
+                println!("got error {:?}", e);
+                $reply.error(e);
+                return;
+            }
+        }
+    }
+}
+const BGDT_OFFSET: u32 = 1;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
@@ -80,6 +119,21 @@ struct Inode {
     dir_acl: u32,
     faddr: u32,
     osd2: [u8; 12],
+}
+
+impl Inode {
+    fn get_kind(&self) -> FileType {
+        match self.mode & 0xf000 {
+            0xc000 => FileType::Socket,
+            0xa000 => FileType::Symlink,
+            0x8000 => FileType::RegularFile,
+            0x6000 => FileType::BlockDevice,
+            0x4000 => FileType::Directory,
+            0x2000 => FileType::CharDevice,
+            0x1000 => FileType::NamedPipe,
+            _ => panic!(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -152,35 +206,205 @@ impl Default for Superblock {
     }
 }
 
+#[repr(C)]
+struct BlockGroupDescTable {
+    block_bitmap: u32,
+    inode_bitmap: u32,
+    inode_table: u32,
+    free_blocks_count: u16,
+    free_inodes_count: u16,
+    used_dir_count: u16,
+    pad: u16,
+    reserved: [u8; 12]
+}
+
+#[derive(Debug)]
+struct FuseDirEntry {
+    inode: u32,
+    filetype: FileType,
+    name: String,
+}
+
+fn ext2_dirent_filetype(file_type: u8) -> FileType {
+    match file_type {
+        1 => FileType::RegularFile,
+        2 => FileType::Directory,
+        3 => FileType::CharDevice,
+        4 => FileType::BlockDevice,
+        5 => FileType::NamedPipe,
+        6 => FileType::Socket,
+        7 => FileType::Symlink,
+        _ => panic!(),
+    }
+}
+
 impl HelloFS {
     fn load_superblock(&mut self) -> Result<(), c_int> {
         self.device.seek(SeekFrom::Start(1024)).map_err(|_| EIO)?;
 
         unsafe {
             let buf: *mut RawSB = std::mem::transmute::<*mut Superblock, *mut RawSB>(&mut self.superblock);
-            self.device.read_exact(&mut *buf);
+            self.device.read_exact(&mut *buf).map_err(|_| EIO)?;
         }
 
         Ok(())
     }
 
+    fn block_size(&self) -> usize {
+        1024 << self.superblock.log_block_size
+    }
+
+    fn block2addr(&self, block_num: u32) -> u64 {
+        (block_num as u64) << ((self.superblock.log_block_size as u64) + 10)
+    }
+
+    fn get_group_first_block(&self, group_num: u32) -> u32 {
+        (self.superblock.first_data_block + (self.superblock.blocks_per_group * group_num)).into()
+    }
+
+    fn load_bitmap_bit(&mut self, bitmap_blk: u32, offset: u32) -> Result<u8, c_int> {
+        let offset_byte = offset / 8;
+        let offset_bit = offset % 8;
+
+        let bitmap_addr = self.block2addr(bitmap_blk);
+
+        let addr = bitmap_addr + offset_byte as u64;
+        self.seek(addr)?;
+
+        let mut buf: [u8;1] = [0];
+        self.device.read_exact(&mut buf).map_err(|_| EIO)?;
+
+        Ok(buf[0] & (1 << offset_bit))
+    }
+
+    // XXX should it load the entire BGDT block or just the table for the given block group?
+    fn load_bgdt(&mut self, group_num: u32) -> Result<BlockGroupDescTable, c_int> {
+        let bdgt_block = self.superblock.first_data_block + BGDT_OFFSET;
+        let bdgt_addr = self.block2addr(bdgt_block) + ((group_num as u64)*size_of::<BlockGroupDescTable>() as u64);
+
+        load_obj!(self.device, BlockGroupDescTable, bdgt_addr)
+    }
+
     fn load_inode(&mut self, ino: u64) -> Result<Inode, c_int> {
-        println!("inodes per group: {}", self.superblock.inodes_per_group);
+        let group_num = (ino - 1) / (self.superblock.inodes_per_group as u64);
+        let inode_table_num = (ino - 1) % (self.superblock.inodes_per_group as u64);
 
-        let group_num = ino / (self.superblock.inodes_per_group as u64);
+        let bgdt = self.load_bgdt(group_num as u32)?;
 
-        let mut inode_buf = [0; size_of::<Inode>()];
-        self.device.read_exact(&mut inode_buf);
+        let is_inode_free = self.load_bitmap_bit(bgdt.inode_bitmap, inode_table_num as u32)? == 0;
+        if is_inode_free {
+            return Err(ENOENT);
+        }
 
-        let inode = unsafe {
-            std::mem::transmute::<[u8; size_of::<Inode>()], Inode>(inode_buf)
-        };
+        let inode_table_blk = bgdt.inode_table;
+        let inode_table_offset = (inode_table_num * size_of::<Inode>() as u64);
+        let inode_addr = self.block2addr(inode_table_blk) + inode_table_offset;
 
-        Ok(inode)
+        load_obj!(self.device, Inode, inode_addr)
+    }
+
+    fn load_dir_entries(&mut self, ino: u64) -> Result<Vec<FuseDirEntry>, c_int> {
+        let inode = self.load_inode(ino)?;
+
+        if inode.get_kind() != FileType::Directory {
+            return Err(ENOTDIR);
+        }
+
+        let mut entries = Vec::new();
+        let size = self.block_size();
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
+
+        // read exact uses len to determine how much to read
+        unsafe { buf.set_len(size); }
+
+        for block_num in &inode.block {
+            if *block_num == 0 {
+                break;
+            }
+
+            let block_addr = self.block2addr(*block_num);
+            println!("load_dir_entries: reading block {} [0x{:x}]", *block_num, block_addr);
+
+            self.seek(block_addr)?;
+            self.device.read_exact(&mut buf).map_err(|_| EIO)?;
+
+            println!("buf: {:?}", buf.len());
+
+            let mut i = 0;
+            let mut buf_ptr = buf.as_ptr();
+            while i < size {
+                unsafe {
+                    let inode: u32 = *(buf_ptr as *const u32);
+                    let rec_len: usize = *(buf_ptr.offset(4) as *const u16) as usize;
+                    let name_len: u8 = *(buf_ptr.offset(6) as *const u8);
+                    let file_type: u8 = *(buf_ptr.offset(7) as *const u8);
+                    let name = std::slice::from_raw_parts(buf_ptr.offset(8), name_len as usize);
+
+                    if rec_len == 0 {
+                        break;
+                    }
+
+                    entries.push(FuseDirEntry {
+                        inode: inode,
+                        filetype: ext2_dirent_filetype(file_type),
+                        name: String::from_utf8_lossy(name).to_string()
+                    });
+
+                    buf_ptr = buf_ptr.add(rec_len);
+                    i += rec_len;
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn seek(&mut self, addr: u64) -> Result<(), c_int> {
+        self.device.seek(SeekFrom::Start(addr)).map_err(|_| EIO);
+        Ok(())
     }
 }
 
+fn inode2fuse(num: u64, i: Inode) -> FileAttr {
+    let kind = i.get_kind();
+    let rdev = match kind {
+        FileType::BlockDevice | FileType::CharDevice => i.block[0],
+        _ => 0
+    };
+
+    FileAttr {
+        ino: map_inode(InodeMapDir::EXT2FUSE, num),
+        size: i.size as u64,
+        blocks: i.blocks as u64,
+        atime: Timespec::new(i.atime as i64, 0),
+        mtime: Timespec::new(i.mtime as i64, 0),
+        ctime: Timespec::new(i.ctime as i64, 0),
+        kind: kind,
+        perm: i.mode & 0xfff,
+        nlink: i.links_count as u32,
+        uid: i.uid as u32,
+        gid: i.gid as u32,
+        rdev: rdev,
+
+        // MacOS only (?)
+        crtime: Timespec::new(0, 0),
+        flags: 0,
+    }
+}
+
+enum InodeMapDir {
+    EXT2FUSE,
+    FUSE2EXT,
+}
+
 /* FUSE uses inode 1 for the root dir, ext2 uses inode 2. inode 1 in ext2 is the bad block inode */
+fn map_inode(dir: InodeMapDir, num: u64) -> u64 {
+    match dir {
+        InodeMapDir::EXT2FUSE => match num { 2 => 1, x => x },
+        InodeMapDir::FUSE2EXT => match num { 1 => 2, x => x },
+    }
+}
+
 impl Filesystem for HelloFS {
     fn init(&mut self, req: &Request) -> Result<(), c_int> {
         println!("device: {:?}", self.device);
@@ -190,24 +414,36 @@ impl Filesystem for HelloFS {
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent = match parent { 1 => 2, x => x };
+        let parent = map_inode(InodeMapDir::FUSE2EXT, parent);
+        let name = try_option!(name.to_str(), reply, ENOENT);
 
-        println!("lookup: parent: {}, name: {}", parent, name.to_str().unwrap());
-        reply.error(ENOENT);
+        println!("lookup: parent: {}, name: {}", parent, name);
+        let entries = try_error!(self.load_dir_entries(parent), reply);
+
+        let ent = entries.iter().find(|e| e.name == name);
+        let ent = try_option!(ent, reply, ENOENT);
+
+        let ino_num: u64 = ent.inode.into();
+
+        let inode = try_error!(self.load_inode(ino_num), reply);
+        let attr = inode2fuse(ino_num, inode);
+        reply.entry(&TTL, &attr, 0)
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let ino = match ino { 1 => 2, x => x };
+        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
 
-        let inode = self.load_inode(ino);
+        println!("getattr {}", ino);
+        let inode = try_error!(self.load_inode(ino), reply);
 
-        println!("getattr: ino: {}, inode {:?}", ino, inode);
-
-        reply.error(ENOENT);
+        let attr = inode2fuse(ino, inode);
+        reply.attr(&TTL, &attr)
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, _size: u32, reply: ReplyData) {
-        let ino = match ino { 1 => 2, x => x };
+        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
+
+        self.load_blocks
 
         println!("read: ino: {}, offset: {}", ino, offset);
 
@@ -215,10 +451,20 @@ impl Filesystem for HelloFS {
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let ino = match ino { 1 => 2, x => x };
+        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
 
         println!("readdir: ino: {}, offset: {}", ino, offset);
-        reply.error(ENOENT);
+        let entries = try_error!(self.load_dir_entries(ino), reply);
+        for (i, ent) in entries.iter().enumerate().skip(offset as usize) {
+            reply.add(
+                map_inode(InodeMapDir::EXT2FUSE, ent.inode as u64),
+                (i + 1) as i64,
+                ent.filetype,
+                ent.name.clone()
+            );
+        }
+
+        reply.ok();
     }
 }
 
