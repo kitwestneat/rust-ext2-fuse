@@ -4,9 +4,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read,Seek, SeekFrom};
 use std::ffi::OsStr;
 use std::str::from_utf8;
-use libc::{c_int, ENOENT, EIO, ENOTDIR};
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use libc::{c_int, ENOENT, EIO, ENOTDIR, EINVAL, ENOSPC};
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory, ReplyCreate};
 use time::Timespec;
+
+macro_rules! ALIGN {
+    (UP, $val:expr, $b:expr) => { ((($val + $b - 1) / $b) * $b) };
+    (DOWN, $val:expr, $b:expr) => { ((($val - 1) / $b) * $b)};
+}
 
 macro_rules! offset_of {
     ($ty:ty, $field:ident) => {
@@ -238,6 +243,8 @@ fn ext2_dirent_filetype(file_type: u8) -> FileType {
     }
 }
 
+const DIRENT_HEADER_LEN: u8 = 8;
+
 impl HelloFS {
     fn load_superblock(&mut self) -> Result<(), c_int> {
         self.device.seek(SeekFrom::Start(1024)).map_err(|_| EIO)?;
@@ -303,6 +310,57 @@ impl HelloFS {
         load_obj!(self.device, Inode, inode_addr)
     }
 
+    fn load_from_blocks(&mut self, ino: u64, offset: usize, load_size: u32) -> Result<Vec<u8>, c_int> {
+        let inode = self.load_inode(ino)?;
+
+        let load_size = load_size as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(load_size);
+        unsafe { buf.set_len(load_size); }
+        let mut buf_ptr = buf.as_mut_ptr();
+
+        let block_size = self.block_size();
+        let read_end = offset + load_size;
+        let block_skip = offset / block_size;
+
+        let mut cursor = block_skip * block_size;
+        for block_num in inode.block.iter().skip(block_skip) {
+            if *block_num == 0 {
+                break;
+            }
+
+            let mut block_addr = self.block2addr(*block_num);
+
+            let amt_left: usize = read_end - cursor;
+            let mut read_size: usize = if amt_left < block_size {
+                amt_left
+            } else {
+                block_size
+            };
+
+            println!("calc blk_offset");
+            let blk_offset = std::cmp::max(offset as i64 - cursor as i64, 0) as usize;
+            read_size -= blk_offset;
+            block_addr += blk_offset as u64;
+            println!("got blk_offset {}", blk_offset);
+
+            let read_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, read_size) };
+
+            println!("load_from_blocks: reading block {} off {} [0x{:x}]", *block_num, blk_offset, block_addr);
+
+            self.seek(block_addr)?;
+            self.device.read_exact(read_slice).map_err(|_| EIO)?;
+
+            if amt_left < block_size {
+                break;
+            }
+
+            cursor += block_size;
+            buf_ptr = unsafe { buf_ptr.add(block_size) };
+        }
+
+        Ok(buf)
+    }
+
     fn load_dir_entries(&mut self, ino: u64) -> Result<Vec<FuseDirEntry>, c_int> {
         let inode = self.load_inode(ino)?;
 
@@ -340,15 +398,25 @@ impl HelloFS {
                     let file_type: u8 = *(buf_ptr.offset(7) as *const u8);
                     let name = std::slice::from_raw_parts(buf_ptr.offset(8), name_len as usize);
 
+                    println!("dirent: inode {} rec_len {} name_len {} ft {} {}",
+                             inode, rec_len, name_len, file_type, String::from_utf8_lossy(name).to_string());
+
                     if rec_len == 0 {
                         break;
                     }
 
-                    entries.push(FuseDirEntry {
-                        inode: inode,
-                        filetype: ext2_dirent_filetype(file_type),
-                        name: String::from_utf8_lossy(name).to_string()
-                    });
+                    // normally there can only be blank dents at the start of a dir block
+                    if inode == 0 && i != 0 {
+                        println!("Warning: blank dentry found not at start of block.");
+                    }
+
+                    if inode != 0 {
+                        entries.push(FuseDirEntry {
+                            inode: inode,
+                            filetype: ext2_dirent_filetype(file_type),
+                            name: String::from_utf8_lossy(name).to_string()
+                        });
+                    }
 
                     buf_ptr = buf_ptr.add(rec_len);
                     i += rec_len;
@@ -363,6 +431,91 @@ impl HelloFS {
         self.device.seek(SeekFrom::Start(addr)).map_err(|_| EIO);
         Ok(())
     }
+
+    /*
+    fn find_create_dir_ent(&mut self, parent: u64, target_name: String, mode: u32) -> Result<(), c_int> {
+        // get dir entries
+        // find dir entry of <name>, or end of entries
+        // if dir entry is found, open file
+        // otherwise, create file
+        //  - alloc inode
+        //  - add dir entry
+
+        let parent_inode = self.load_inode(parent)?;
+        if parent_inode.get_kind() != FileType::Directory {
+            return Err(ENOTDIR);
+        }
+
+        let target_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + target_name.len(), 4);
+        println!("target_rec_len {}", target_rec_len);
+
+        let size = self.block_size();
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
+
+        // read exact uses len to determine how much to read
+        unsafe { buf.set_len(size); }
+
+        // dirent with space to split
+        let mut alloc_buf_addr = 0;
+        let mut alloc_buf_len = 0;
+
+        let block_idx = 0;
+        for block_num in &inode.block {
+            if *block_num == 0 {
+                break;
+            }
+            block_idx += 1;
+
+            let block_addr = self.block2addr(*block_num);
+            println!("load_dir_entries: reading block {} [0x{:x}]", *block_num, block_addr);
+
+            self.seek(block_addr)?;
+            self.device.read_exact(&mut buf).map_err(|_| EIO)?;
+
+            println!("buf: {:?}", buf.len());
+
+            let mut i = 0;
+            let mut buf_ptr = buf.as_ptr();
+            while i < size {
+                unsafe {
+                    let inode: u32 = *(buf_ptr as *const u32);
+                    let rec_len: usize = *(buf_ptr.offset(4) as *const u16) as usize;
+                    let name_len: u8 = *(buf_ptr.offset(6) as *const u8);
+                    let file_type: u8 = *(buf_ptr.offset(7) as *const u8);
+                    let name = std::slice::from_raw_parts(buf_ptr.offset(8), name_len as usize);
+
+                    if rec_len == 0 {
+                        break;
+                    }
+
+                    if name == target_name {
+                        return self.open_inode(inode);
+                    }
+
+                    let min_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + name_len, 4);
+                    if alloc_buf_len == 0 && min_rec_len + target_rec_len <= rec_len {
+                        alloc_buf_len = rec_len;
+                        alloc_buf_addr = block_addr + i;
+                    }
+
+                    buf_ptr = buf_ptr.add(rec_len);
+                    i += rec_len;
+                }
+            }
+        }
+
+        // never found a dirent to alloc into, create a new block
+        if alloc_buf_len == 0 {
+            let block_num = self.alloc_block(parent, parent_inode)?;
+            alloc_buf_len
+
+        }
+
+
+
+        Ok(())
+    }
+    */
 }
 
 fn inode2fuse(num: u64, i: Inode) -> FileAttr {
@@ -440,14 +593,15 @@ impl Filesystem for HelloFS {
         reply.attr(&TTL, &attr)
     }
 
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, _size: u32, reply: ReplyData) {
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
         let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
 
-        self.load_blocks
 
         println!("read: ino: {}, offset: {}", ino, offset);
+        let buf = try_error!(self.load_from_blocks(ino, offset as usize, size), reply);
 
-        reply.error(ENOENT);
+        println!("read {}", String::from_utf8_lossy(&buf).to_string());
+        reply.data(&buf);
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
@@ -466,20 +620,31 @@ impl Filesystem for HelloFS {
 
         reply.ok();
     }
+
+    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {
+        let parent = map_inode(InodeMapDir::FUSE2EXT, parent);
+        let name = try_option!(name.to_str(), reply, EINVAL);
+
+        println!("create: parent: {}, name: {}, mode {:o}", parent, name, mode);
+
+        try_error!(self.find_create_dir_ent(parent, name.to_string(), mode), reply);
+
+    }
 }
 
 fn main() {
     env_logger::init();
     let mountpoint = env::args_os().nth(1).unwrap();
     let device = env::args_os().nth(2).unwrap();
-    let options = ["-o", "ro", "-o", "fsname=hello"]
+    //let options = ["-o", "ro", "-o", "fsname=hello"]
+    let options = ["-o", "fsname=hello"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
 
     let fs = HelloFS {
-        device: OpenOptions::new().write(true).read(true).open(device).unwrap(), 
-        superblock: Default::default() 
+        device: OpenOptions::new().write(true).read(true).open(device).unwrap(),
+        superblock: Default::default()
     };
 
     fuse::mount(fs, &mountpoint, &options).unwrap();
