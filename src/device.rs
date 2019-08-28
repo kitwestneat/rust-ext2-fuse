@@ -4,7 +4,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read,Seek, SeekFrom, Write};
 use std::mem::{size_of};
 use std::sync::Mutex;
-use std::marker::Sized;
 
 trait Loadable {}
 trait Storable {}
@@ -52,15 +51,17 @@ impl Device {
     pub fn read_at(&self, buf: &mut [u8], addr: u64) -> Result<(), c_int> {
         let mut dev = self.file.lock().unwrap();
 
+        println!("reading {} bytes from {:x} into {:p}", buf.len(), addr, buf);
+
         dev.seek(SeekFrom::Start(addr)).map_err(|_| EIO)?;
         dev.read_exact(buf).map_err(|_| EIO)?;
 
         Ok(())
     }
 
-    pub fn store<T>(&self, obj: &T, addr: u64) -> Result<(), c_int> where T: Sized {
+    pub fn store<T>(&self, obj: &T, addr: u64) -> Result<(), c_int> {
         let buf = unsafe {
-            std::slice::from_raw_parts((&obj as *const _) as *const u8, size_of::<T>())
+            std::slice::from_raw_parts((obj as *const _) as *const u8, size_of::<T>())
         };
 
         self.write_at(buf, addr)

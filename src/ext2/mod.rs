@@ -1,3 +1,4 @@
+use std::cmp;
 use std::mem::{size_of};
 use libc::{c_int, ENOENT, EIO, ENOTDIR, ENOSPC};
 use std::time::SystemTime;
@@ -247,6 +248,7 @@ impl Iterator for InodeBlockIterator<'_> {
 
         // does this fit in indirect blocks?
         if indirect_offset < page_blocks {
+            println!("using indirect blocks");
             if self.indirect_block_page.len() == 0 {
                 self.fs.load_block(self.block[INDIRECT_BLOCK_INDEX], &mut self.indirect_block_page).unwrap();
             }
@@ -260,8 +262,9 @@ impl Iterator for InodeBlockIterator<'_> {
 
         let double_page_blocks = page_blocks * page_blocks;
 
-        // does this fit in indirect blocks?
+        // does this fit in double indirect blocks?
         if indirect_offset < double_page_blocks {
+            println!("using double indirect blocks");
             let double_indirect_offset = indirect_offset / page_blocks;
             indirect_offset = indirect_offset % page_blocks;
 
@@ -278,6 +281,7 @@ impl Iterator for InodeBlockIterator<'_> {
             return Some(ret);
         }
 
+        println!("using triple indirect blocks");
         indirect_offset -= double_page_blocks;
         let triple_indirect_offset = indirect_offset / double_page_blocks;
         let double_indirect_offset = (indirect_offset % double_page_blocks) / page_blocks;
@@ -326,22 +330,28 @@ impl HelloFS {
 
     // XXX should store backup blocks too
     fn store_superblock(&self) -> Result<(), c_int> {
-        self.device.store(&self.superblock, SUPERBLOCK_ADDR)
+        self.device.store::<Superblock>(&self.superblock, SUPERBLOCK_ADDR)
     }
 
     fn load_block<T>(&self, block_no: u32, buf: &mut Vec<T>) -> Result<(), c_int> {
         let expected_count = self.block_size() / size_of::<T>();
 
+        println!("loading block {} into buf {:p} (len:{}), expected count: {}", block_no, buf, buf.len(), expected_count);
+
         if buf.len() == 0 {
             buf.reserve(expected_count);
             unsafe { buf.set_len(expected_count); }
+            println!("resizing buf to {}, new len {}", expected_count, buf.len());
         } else if buf.len() != expected_count {
             panic!("unexpected buffer size");
         }
 
         let addr = self.block2addr(block_no);
+        let load_size = expected_count * size_of::<T>();
+        let buf_ptr = buf.as_mut_ptr() as *mut u8;
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, load_size) };
 
-        self.device.load_in(buf, addr)
+        self.device.read_at(slice, addr)
     }
 
     fn get_inode_blocks<'a>(&'a self, inode: &'a Inode) -> InodeBlockIterator<'a> {
@@ -447,11 +457,15 @@ impl HelloFS {
         }
 
         let mut buf: Vec<u8> = Vec::new();
+        println!("loading inode_bitmap into {:p}", &buf);
+
         self.load_block(bgdt.inode_bitmap, &mut buf)?;
+        println!("loaded, new buf size: {}", buf.len());
 
         // find open inode in bitmap
         let mut inode_table_num = 0;
         for b in &mut buf {
+            println!("b[{:p}]={:x}", b, *b);
             if *b == 0xff {
                 inode_table_num += 8;
                 continue;
@@ -471,16 +485,21 @@ impl HelloFS {
             break;
         }
 
+        println!("writing inode bitmap");
         let bitmap_addr = self.block2addr(bgdt.inode_bitmap);
         self.device.write_at(&buf, bitmap_addr)?;
 
+        println!("writing bgdt");
         bgdt.free_inodes_count -= 1;
         self.store_bgdt(group_idx, &bgdt)?;
 
+        println!("writing superblock");
         self.superblock.free_inodes_count -= 1;
         self.store_superblock()?;
 
         let inode_num = group_idx * self.superblock.inodes_per_group + inode_table_num + 1;
+
+        println!("created inode {}, group_idx {}, inode_table_num {}", inode_num,group_idx, inode_table_num);
 
         Ok(inode_num)
     }
@@ -488,7 +507,7 @@ impl HelloFS {
     fn load_from_blocks(&mut self, ino: u64, offset: usize, load_size: u32) -> Result<Vec<u8>, c_int> {
         let inode = self.load_inode(ino)?;
 
-        let load_size = load_size as usize;
+        let load_size = cmp::min(load_size as usize, inode.get_size());
         let mut buf: Vec<u8> = Vec::with_capacity(load_size);
         unsafe { buf.set_len(load_size); }
         let mut buf_ptr = buf.as_mut_ptr();
@@ -514,7 +533,7 @@ impl HelloFS {
             };
 
             println!("calc blk_offset");
-            let blk_offset = std::cmp::max(offset as i64 - cursor as i64, 0) as usize;
+            let blk_offset = cmp::max(offset as i64 - cursor as i64, 0) as usize;
             read_size -= blk_offset;
             block_addr += blk_offset as u64;
             println!("got blk_offset {}", blk_offset);

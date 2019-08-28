@@ -112,10 +112,9 @@ impl Filesystem for HelloFS {
         let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
 
 
-        println!("read: ino: {}, offset: {}", ino, offset);
+        println!("read: ino: {}, offset: {}, size {}", ino, offset, size);
         let buf = try_error!(self.load_from_blocks(ino, offset as usize, size), reply);
 
-        println!("read {}", String::from_utf8_lossy(&buf).to_string());
         reply.data(&buf);
     }
 
