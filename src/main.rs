@@ -1,12 +1,20 @@
 use std::env;
-use std::mem::size_of;
+use std::mem::{size_of,size_of_val};
 use std::fs::{File, OpenOptions};
-use std::io::{Read,Seek, SeekFrom};
+use std::io::{Read,Seek, SeekFrom, Write};
 use std::ffi::OsStr;
 use std::str::from_utf8;
 use libc::{c_int, ENOENT, EIO, ENOTDIR, EINVAL, ENOSPC};
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory, ReplyCreate};
 use time::Timespec;
+use std::time::SystemTime;
+use std::convert::TryInto;
+
+use fuse::{FileType};
+
+mod filesystem;
+mod device;
+
+use device::Device;
 
 macro_rules! ALIGN {
     (UP, $val:expr, $b:expr) => { ((($val + $b - 1) / $b) * $b) };
@@ -19,93 +27,18 @@ macro_rules! offset_of {
     }
 }
 
-macro_rules! load_obj {
-    ($dev:expr, $ty:ty, $addr:expr) => {{
-        let mut buf = [0; size_of::<$ty>()];
-        $dev.seek(SeekFrom::Start($addr)).map_err(|_| EIO)?;
-        $dev.read_exact(&mut buf).map_err(|_| EIO)?;
-
-        let obj = unsafe {
-            std::mem::transmute::<[u8; size_of::<$ty>()], $ty>(buf)
-        };
-
-        Ok(obj)
-    }}
-}
-
-macro_rules! try_option {
-    ($e:expr,$reply:ident,$err:ident) => {
-        match $e {
-            Some(v) => v,
-            None => {
-                $reply.error($err);
-                return;
-            }
-        }
-    }
-}
-macro_rules! try_error {
-    ($e:expr, $reply: ident) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => {
-                println!("got error {:?}", e);
-                $reply.error(e);
-                return;
-            }
-        }
-    }
-}
 const BGDT_OFFSET: u32 = 1;
-
-const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
 const EPOCH: Timespec = Timespec { sec: 0, nsec: 0 };
 
-const HELLO_DIR_ATTR: FileAttr = FileAttr {
-    ino: 1,
-    size: 0,
-    blocks: 0,
-    atime: EPOCH,                                  // 1970-01-01 00:00:00
-    mtime: EPOCH,
-    ctime: EPOCH,
-    crtime: EPOCH,
-    kind: FileType::Directory,
-    perm: 0o755,
-    nlink: 2,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-};
-
-const HELLO_TXT_CONTENT: &str = "Hello World!\n";
-
-const HELLO_TXT_ATTR: FileAttr = FileAttr {
-    ino: 2,
-    size: 13,
-    blocks: 1,
-    atime: EPOCH,                                  // 1970-01-01 00:00:00
-    mtime: EPOCH,
-    ctime: EPOCH,
-    crtime: EPOCH,
-    kind: FileType::RegularFile,
-    perm: 0o644,
-    nlink: 1,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-};
-
 struct HelloFS {
-    device: File,
+    device: Device,
     superblock: Superblock,
 }
 
 #[derive(Default, Debug)]
 #[repr(C)]
-struct Inode {
+pub struct Inode {
     mode: u16,
     uid: u16,
     size: u32,
@@ -127,8 +60,8 @@ struct Inode {
 }
 
 impl Inode {
-    fn get_kind(&self) -> FileType {
-        match self.mode & 0xf000 {
+    fn get_kind(&self) -> Option<FileType> {
+        Some(match self.mode & 0xf000 {
             0xc000 => FileType::Socket,
             0xa000 => FileType::Symlink,
             0x8000 => FileType::RegularFile,
@@ -136,7 +69,15 @@ impl Inode {
             0x4000 => FileType::Directory,
             0x2000 => FileType::CharDevice,
             0x1000 => FileType::NamedPipe,
-            _ => panic!(),
+            _ => return None,
+        })
+    }
+
+    fn get_size(&self) -> usize {
+        if self.get_kind() == Some(FileType::RegularFile) {
+            (self.dir_acl as usize) << 32 | (self.size as usize)
+        } else {
+            self.size as usize
         }
     }
 }
@@ -230,8 +171,16 @@ struct FuseDirEntry {
     name: String,
 }
 
-fn ext2_dirent_filetype(file_type: u8) -> FileType {
-    match file_type {
+struct ExtDirEnt<'a> {
+    inode: u32,
+    rec_len: usize,
+    name_len: u8,
+    file_type: u8,
+    name: &'a [u8]
+}
+
+fn ext2_dirent_filetype(file_type: u8) -> Option<FileType> {
+    Some(match file_type {
         1 => FileType::RegularFile,
         2 => FileType::Directory,
         3 => FileType::CharDevice,
@@ -239,11 +188,136 @@ fn ext2_dirent_filetype(file_type: u8) -> FileType {
         5 => FileType::NamedPipe,
         6 => FileType::Socket,
         7 => FileType::Symlink,
+        _ => { println!("filetype {} unknown", file_type); return None }
+    })
+}
+
+fn get_ext2_dirent_ft_from_kind(ft: FileType) -> u8 {
+    match ft {
+        FileType::RegularFile => 1,
+        FileType::Directory => 2,
+        FileType::CharDevice => 3,
+        FileType::BlockDevice => 4,
+        FileType::NamedPipe => 5,
+        FileType::Socket => 6,
+        FileType::Symlink => 7,
         _ => panic!(),
     }
 }
 
 const DIRENT_HEADER_LEN: u8 = 8;
+
+struct InodeBlockIterator<'a> {
+    block: &'a [u32],
+    block_offset: u32,
+    block_limit: u32,
+    indirect_block_page: Vec<u32>,
+    double_indirect_block_page: Vec<u32>,
+    triple_indirect_block_page: Vec<u32>,
+    fs: &'a mut HelloFS,
+}
+
+impl <'a> InodeBlockIterator<'a> {
+    pub fn new(inode: &'a Inode, fs: &'a mut HelloFS) -> Self {
+        Self {
+            block: &inode.block,
+            block_limit: (inode.get_size() / fs.block_size()) as u32,
+            block_offset: 0,
+            fs: fs,
+            indirect_block_page: Vec::new(),
+            double_indirect_block_page: Vec::new(),
+            triple_indirect_block_page: Vec::new(),
+        }
+    }
+}
+
+const INDIRECT_BLOCK_INDEX: usize = 12;
+const DOUBLE_INDIRECT_BLOCK_INDEX: usize = 13;
+const TRIPLE_INDIRECT_BLOCK_INDEX: usize = 14;
+
+impl Iterator for InodeBlockIterator<'_> {
+    type Item = u32;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.block_offset > self.block_limit {
+            return None;
+        }
+
+        // does this fit in direct blocks?
+        if self.block_offset < INDIRECT_BLOCK_INDEX  as u32 {
+            let ret = self.block[self.block_offset as usize];
+
+            self.block_offset += 1;
+            return Some(ret);
+        }
+
+        let page_blocks = self.fs.block_size() / size_of::<u32>();
+        let mut indirect_offset: usize = self.block_offset as usize - INDIRECT_BLOCK_INDEX as usize;
+
+        // does this fit in indirect blocks?
+        if indirect_offset < page_blocks {
+            if self.indirect_block_page.len() == 0 {
+                self.fs.load_block(self.block[INDIRECT_BLOCK_INDEX], &mut self.indirect_block_page);
+            }
+            let ret = self.indirect_block_page[indirect_offset];
+
+            self.block_offset += 1;
+            return Some(ret);
+        }
+
+        indirect_offset -= page_blocks;
+
+        let double_page_blocks = page_blocks * page_blocks;
+
+        // does this fit in indirect blocks?
+        if indirect_offset < double_page_blocks {
+            let double_indirect_offset = indirect_offset / page_blocks;
+            indirect_offset = indirect_offset % page_blocks;
+
+            if self.double_indirect_block_page.len() == 0 {
+                self.fs.load_block(self.block[DOUBLE_INDIRECT_BLOCK_INDEX], &mut self.double_indirect_block_page);
+            }
+            if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
+                self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page);
+            }
+
+            let ret = self.indirect_block_page[indirect_offset];
+
+            self.block_offset += 1;
+            return Some(ret);
+        }
+
+        indirect_offset -= double_page_blocks;
+        let triple_indirect_offset = indirect_offset / double_page_blocks;
+        let double_indirect_offset = (indirect_offset % double_page_blocks) / page_blocks;
+        indirect_offset = (indirect_offset % double_indirect_offset) % page_blocks;
+
+        if self.triple_indirect_block_page.len() == 0 {
+            self.fs.load_block(self.block[TRIPLE_INDIRECT_BLOCK_INDEX], &mut self.triple_indirect_block_page);
+        }
+        if double_indirect_offset == 0 || self.double_indirect_block_page.len() == 0 {
+            self.fs.load_block(self.triple_indirect_block_page[triple_indirect_offset], &mut self.double_indirect_block_page);
+        }
+        if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
+            self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page);
+        }
+
+        let ret = self.indirect_block_page[indirect_offset];
+
+        self.block_offset += 1;
+        return Some(ret);
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.block_offset += n as u32;
+
+        // clear block page caches, could possibly save some if n is small enough
+        self.indirect_block_page = Vec::new();
+        self.double_indirect_block_page = Vec::new();
+        self.triple_indirect_block_page = Vec::new();
+
+        self.next()
+    }
+}
 
 impl HelloFS {
     fn load_superblock(&mut self) -> Result<(), c_int> {
@@ -255,6 +329,36 @@ impl HelloFS {
         }
 
         Ok(())
+    }
+
+    // XXX should store backup blocks too
+    fn store_superblock(&mut self) -> Result<(), c_int> {
+        store_obj!(self.device, self.superblock, 1024);
+
+        Ok(())
+    }
+
+    fn load_block<T>(&mut self, block_no: u32, buf: &mut Vec<T>) -> Result<(), c_int> {
+        let expected_count = self.block_size() / size_of::<T>();
+
+        if buf.len() == 0 {
+            buf.reserve(expected_count);
+            unsafe { buf.set_len(expected_count); }
+        } else if buf.len() != expected_count {
+            panic!("unexpected buffer size");
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, self.block_size()) };
+
+        let addr = self.block2addr(block_no);
+        self.seek(addr)?;
+        self.device.read_exact(slice).map_err(|_| EIO)?;
+
+        Ok(())
+    }
+
+    fn get_inode_blocks<'a>(&'a mut self, inode: &'a Inode) -> InodeBlockIterator<'a> {
+        InodeBlockIterator::new(inode, self)
     }
 
     fn block_size(&self) -> usize {
@@ -292,9 +396,24 @@ impl HelloFS {
         load_obj!(self.device, BlockGroupDescTable, bdgt_addr)
     }
 
-    fn load_inode(&mut self, ino: u64) -> Result<Inode, c_int> {
+    // XXX should store backup blocks too
+    fn store_bgdt(&mut self, group_num: u32, bgdt: &BlockGroupDescTable) -> Result<(), c_int> {
+        let bdgt_block = self.superblock.first_data_block + BGDT_OFFSET;
+        let bdgt_addr = self.block2addr(bdgt_block) + ((group_num as u64)*size_of::<BlockGroupDescTable>() as u64);
+
+        store_obj!(self.device, *bgdt, bdgt_addr);
+
+        Ok(())
+    }
+    fn get_inode_group_info(&self, ino: u64) -> (u64, u64) {
         let group_num = (ino - 1) / (self.superblock.inodes_per_group as u64);
         let inode_table_num = (ino - 1) % (self.superblock.inodes_per_group as u64);
+
+        (group_num, inode_table_num)
+    }
+
+    fn load_inode(&mut self, ino: u64) -> Result<Inode, c_int> {
+        let (group_num, inode_table_num) = self.get_inode_group_info(ino);
 
         let bgdt = self.load_bgdt(group_num as u32)?;
 
@@ -310,6 +429,84 @@ impl HelloFS {
         load_obj!(self.device, Inode, inode_addr)
     }
 
+    fn store_inode(&mut self, ino: u64, inode: &Inode) -> Result<(), c_int> {
+        let (group_num, inode_table_num) = self.get_inode_group_info(ino);
+
+        let bgdt = self.load_bgdt(group_num as u32)?;
+
+        let inode_table_blk = bgdt.inode_table;
+        let inode_table_offset = (inode_table_num * size_of::<Inode>() as u64);
+        let inode_addr = self.block2addr(inode_table_blk) + inode_table_offset;
+
+        store_obj!(self.device, *inode, inode_addr);
+
+        Ok(())
+    }
+
+    // try to allocate an inode close to the parent
+    fn alloc_inode(&mut self, parent_ino: u64) -> Result<u32, c_int> {
+        let (group_num, _) = self.get_inode_group_info(parent_ino);
+
+        let mut bgdt = self.load_bgdt(group_num as u32)?;
+        let total_group_count = self.superblock.blocks_count / self.superblock.blocks_per_group;
+
+        let mut group_idx = group_num as u32;
+        while bgdt.free_inodes_count == 0 {
+            group_idx = (group_idx + 1) % total_group_count;
+            if group_idx as u64 == group_num {
+                return Err(ENOSPC);
+            }
+
+            bgdt = self.load_bgdt(group_idx)?;
+        }
+
+        let bitmap_addr = self.block2addr(bgdt.inode_bitmap);
+
+        let size = self.block_size();
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
+
+        // read exact uses len to determine how much to read
+        unsafe { buf.set_len(size); }
+
+        self.seek(bitmap_addr)?;
+        self.device.read_exact(&mut buf).map_err(|_| EIO)?;
+
+        // find open inode in bitmap
+        let mut inode_table_num = 0;
+        for b in &mut buf {
+            if *b == 0xff {
+                inode_table_num += 8;
+                continue;
+            }
+            let mut byte = *b;
+
+            let mut shift = 0;
+            while byte & 0x1 != 0 {
+                byte = byte >> 1;
+                shift += 1;
+            }
+
+            println!("flipping bitmap: b: {:x} shift: {}, int: {}", *b, shift, inode_table_num);
+            *b = *b | (1 << shift);
+            inode_table_num += shift;
+
+            break;
+        }
+
+        self.seek(bitmap_addr)?;
+        self.device.write_all(&buf).map_err(|_| EIO)?;
+
+        bgdt.free_inodes_count -= 1;
+        self.store_bgdt(group_idx, &bgdt)?;
+
+        self.superblock.free_inodes_count -= 1;
+        self.store_superblock();
+
+        let inode_num = group_idx * self.superblock.inodes_per_group + inode_table_num + 1;
+
+        Ok(inode_num)
+    }
+
     fn load_from_blocks(&mut self, ino: u64, offset: usize, load_size: u32) -> Result<Vec<u8>, c_int> {
         let inode = self.load_inode(ino)?;
 
@@ -323,12 +520,13 @@ impl HelloFS {
         let block_skip = offset / block_size;
 
         let mut cursor = block_skip * block_size;
-        for block_num in inode.block.iter().skip(block_skip) {
-            if *block_num == 0 {
+        let iter = self.get_inode_blocks(&inode);
+        for block_num in iter.skip(block_skip) {
+            if block_num == 0 {
                 break;
             }
 
-            let mut block_addr = self.block2addr(*block_num);
+            let mut block_addr = self.block2addr(block_num);
 
             let amt_left: usize = read_end - cursor;
             let mut read_size: usize = if amt_left < block_size {
@@ -345,7 +543,7 @@ impl HelloFS {
 
             let read_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, read_size) };
 
-            println!("load_from_blocks: reading block {} off {} [0x{:x}]", *block_num, blk_offset, block_addr);
+            println!("load_from_blocks: reading block {} off {} [0x{:x}]", block_num, blk_offset, block_addr);
 
             self.seek(block_addr)?;
             self.device.read_exact(read_slice).map_err(|_| EIO)?;
@@ -361,14 +559,12 @@ impl HelloFS {
         Ok(buf)
     }
 
-    fn load_dir_entries(&mut self, ino: u64) -> Result<Vec<FuseDirEntry>, c_int> {
-        let inode = self.load_inode(ino)?;
-
-        if inode.get_kind() != FileType::Directory {
+    // callback returns true if should stop
+    fn walk_dir_entries(&mut self, inode: &Inode, mut cb: impl FnMut(usize, usize, &ExtDirEnt) -> Result<bool, c_int> ) -> Result<bool, c_int> {
+        if inode.get_kind() != Some(FileType::Directory) {
             return Err(ENOTDIR);
         }
 
-        let mut entries = Vec::new();
         let size = self.block_size();
         let mut buf: Vec<u8> = Vec::with_capacity(size);
 
@@ -377,7 +573,7 @@ impl HelloFS {
 
         for block_num in &inode.block {
             if *block_num == 0 {
-                break;
+                continue;
             }
 
             let block_addr = self.block2addr(*block_num);
@@ -388,9 +584,9 @@ impl HelloFS {
 
             println!("buf: {:?}", buf.len());
 
-            let mut i = 0;
+            let mut block_offset = 0;
             let mut buf_ptr = buf.as_ptr();
-            while i < size {
+            while block_offset < size {
                 unsafe {
                     let inode: u32 = *(buf_ptr as *const u32);
                     let rec_len: usize = *(buf_ptr.offset(4) as *const u16) as usize;
@@ -405,35 +601,87 @@ impl HelloFS {
                         break;
                     }
 
-                    // normally there can only be blank dents at the start of a dir block
-                    if inode == 0 && i != 0 {
-                        println!("Warning: blank dentry found not at start of block.");
-                    }
+                    let dirent = ExtDirEnt {
+                        inode: inode,
+                        rec_len: rec_len,
+                        name_len: name_len,
+                        file_type: file_type,
+                        name: name,
+                    };
 
-                    if inode != 0 {
-                        entries.push(FuseDirEntry {
-                            inode: inode,
-                            filetype: ext2_dirent_filetype(file_type),
-                            name: String::from_utf8_lossy(name).to_string()
-                        });
+                    if cb(block_addr as usize, block_offset, &dirent)? {
+                        return Ok(true);
                     }
 
                     buf_ptr = buf_ptr.add(rec_len);
-                    i += rec_len;
+                    block_offset += rec_len;
                 }
             }
         }
+        Ok(false)
+    }
+
+    fn load_dir_entries(&mut self, ino: u64) -> Result<Vec<FuseDirEntry>, c_int> {
+        let mut entries = Vec::new();
+
+        let inode = self.load_inode(ino)?;
+        self.walk_dir_entries(&inode, |_,block_offset, dirent| {
+            let inode = dirent.inode;
+
+            if inode != 0 {
+                let filetype = match ext2_dirent_filetype(dirent.file_type) {
+                    Some(ft) => ft,
+                    None => return Ok(false),
+                };
+
+                entries.push(FuseDirEntry {
+                    inode: inode,
+                    filetype: filetype,
+                    name: String::from_utf8_lossy(dirent.name).to_string()
+                });
+            }
+
+            Ok(false)
+        });
 
         Ok(entries)
     }
 
-    fn seek(&mut self, addr: u64) -> Result<(), c_int> {
-        self.device.seek(SeekFrom::Start(addr)).map_err(|_| EIO);
-        Ok(())
-    }
-
     /*
-    fn find_create_dir_ent(&mut self, parent: u64, target_name: String, mode: u32) -> Result<(), c_int> {
+    fn unlink_dir_ent(&mut self, parent: u64, target_name: String) -> Result<(), c_int> {
+        // find dir entry of <name>
+        // expand dir entry of previous entry
+
+        let mut prev_ent = std::ptr::null();
+
+        let parent_inode = self.load_inode(parent)?;
+        self.walk_dir_entries(&parent_inode, |block_addr, block_offset, dirent| {
+            let dirent_name = String::from_utf8_lossy(dirent.name).to_string();
+            if dirent_name == target_name {
+                // XXX should we actually open this sometime?
+                opened_inode = Some(dirent.inode);
+
+                // this direntry was deleted, but we can reuse it
+                if (dirent.inode == 0) {
+                    alloc_buf_len = dirent.rec_len;
+                    alloc_buf_addr = block_addr + block_offset;
+                }
+
+                return Ok(true);
+            }
+
+            let min_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + dirent.name_len as usize, 4);
+            if alloc_buf_len == 0 && min_rec_len + target_rec_len <= dirent.rec_len {
+                alloc_buf_len = dirent.rec_len;
+                alloc_buf_addr = block_addr + block_offset;
+            }
+
+            Ok(false)
+        });
+    */
+
+
+    fn find_create_dir_ent(&mut self, parent: u64, target_name: String, mode: u32, rdev: u32) -> Result<(u32, Inode), c_int> {
         // get dir entries
         // find dir entry of <name>, or end of entries
         // if dir entry is found, open file
@@ -441,196 +689,116 @@ impl HelloFS {
         //  - alloc inode
         //  - add dir entry
 
-        let parent_inode = self.load_inode(parent)?;
-        if parent_inode.get_kind() != FileType::Directory {
-            return Err(ENOTDIR);
-        }
-
         let target_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + target_name.len(), 4);
         println!("target_rec_len {}", target_rec_len);
 
-        let size = self.block_size();
-        let mut buf: Vec<u8> = Vec::with_capacity(size);
-
-        // read exact uses len to determine how much to read
-        unsafe { buf.set_len(size); }
-
-        // dirent with space to split
-        let mut alloc_buf_addr = 0;
         let mut alloc_buf_len = 0;
+        let mut alloc_buf_addr = 0;
+        let mut opened_inode = None;
 
-        let block_idx = 0;
-        for block_num in &inode.block {
-            if *block_num == 0 {
-                break;
-            }
-            block_idx += 1;
+        let parent_inode = self.load_inode(parent)?;
+        self.walk_dir_entries(&parent_inode, |block_addr, block_offset, dirent| {
+            let dirent_name = String::from_utf8_lossy(dirent.name).to_string();
+            if dirent_name == target_name {
+                // XXX should we actually open this sometime?
+                opened_inode = Some(dirent.inode);
 
-            let block_addr = self.block2addr(*block_num);
-            println!("load_dir_entries: reading block {} [0x{:x}]", *block_num, block_addr);
-
-            self.seek(block_addr)?;
-            self.device.read_exact(&mut buf).map_err(|_| EIO)?;
-
-            println!("buf: {:?}", buf.len());
-
-            let mut i = 0;
-            let mut buf_ptr = buf.as_ptr();
-            while i < size {
-                unsafe {
-                    let inode: u32 = *(buf_ptr as *const u32);
-                    let rec_len: usize = *(buf_ptr.offset(4) as *const u16) as usize;
-                    let name_len: u8 = *(buf_ptr.offset(6) as *const u8);
-                    let file_type: u8 = *(buf_ptr.offset(7) as *const u8);
-                    let name = std::slice::from_raw_parts(buf_ptr.offset(8), name_len as usize);
-
-                    if rec_len == 0 {
-                        break;
-                    }
-
-                    if name == target_name {
-                        return self.open_inode(inode);
-                    }
-
-                    let min_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + name_len, 4);
-                    if alloc_buf_len == 0 && min_rec_len + target_rec_len <= rec_len {
-                        alloc_buf_len = rec_len;
-                        alloc_buf_addr = block_addr + i;
-                    }
-
-                    buf_ptr = buf_ptr.add(rec_len);
-                    i += rec_len;
+                // this direntry was deleted, but we can reuse it
+                if (dirent.inode == 0) {
+                    alloc_buf_len = dirent.rec_len;
+                    alloc_buf_addr = block_addr + block_offset;
                 }
+
+                return Ok(true);
             }
-        }
+
+            let min_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + dirent.name_len as usize, 4);
+            if alloc_buf_len == 0 && min_rec_len + target_rec_len <= dirent.rec_len {
+                alloc_buf_len = dirent.rec_len;
+                alloc_buf_addr = block_addr + block_offset;
+            }
+
+            Ok(false)
+        });
+
+        match opened_inode {
+            Some(0) | None => {},
+            Some(inode_num) => {
+                let inode = self.load_inode(inode_num as u64)?;
+                return Ok((inode_num, inode));
+            }
+        };
+
+        let new_directory_block = alloc_buf_len == 0;
 
         // never found a dirent to alloc into, create a new block
-        if alloc_buf_len == 0 {
+        /*
+        if new_directory_block {
             let block_num = self.alloc_block(parent, parent_inode)?;
             alloc_buf_len
 
         }
+        */
 
+        let new_inode_num = self.alloc_inode(parent)?;
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|_| EIO)?.as_secs();
+        let mut new_inode = Inode {
+            mode: mode as u16,
+            atime: now as u32,
+            ctime: now as u32,
+            mtime: now as u32,
+            links_count: 1,
+            ..Default::default()
+        };
+        new_inode.block[0] = rdev;
+        self.store_inode(new_inode_num as u64, &new_inode);
 
+        let mut buf: Vec<u8> = Vec::with_capacity(alloc_buf_len);
+        unsafe { buf.set_len(alloc_buf_len); }
 
-        Ok(())
-    }
-    */
-}
+        self.seek(alloc_buf_addr as u64)?;
+        self.device.read_exact(&mut buf).map_err(|_| EIO)?;
 
-fn inode2fuse(num: u64, i: Inode) -> FileAttr {
-    let kind = i.get_kind();
-    let rdev = match kind {
-        FileType::BlockDevice | FileType::CharDevice => i.block[0],
-        _ => 0
-    };
+        let mut buf_ptr = buf.as_mut_ptr();
+        unsafe {
+            // if opened_inode is none, then need to create a new dirent
+            if opened_inode.is_none() {
+                let mut new_rec_len = alloc_buf_len;
 
-    FileAttr {
-        ino: map_inode(InodeMapDir::EXT2FUSE, num),
-        size: i.size as u64,
-        blocks: i.blocks as u64,
-        atime: Timespec::new(i.atime as i64, 0),
-        mtime: Timespec::new(i.mtime as i64, 0),
-        ctime: Timespec::new(i.ctime as i64, 0),
-        kind: kind,
-        perm: i.mode & 0xfff,
-        nlink: i.links_count as u32,
-        uid: i.uid as u32,
-        gid: i.gid as u32,
-        rdev: rdev,
+                if (!new_directory_block) {
+                    let rec_len: usize = *(buf_ptr.offset(4) as *const u16) as usize;
+                    let name_len: u8 = *(buf_ptr.offset(6) as *const u8);
 
-        // MacOS only (?)
-        crtime: Timespec::new(0, 0),
-        flags: 0,
-    }
-}
+                    // resize existing dirent
+                    let min_rec_len = ALIGN!(UP, DIRENT_HEADER_LEN as usize + name_len as usize, 4);
+                    *(buf_ptr.offset(4) as *mut u16) = min_rec_len as u16;
 
-enum InodeMapDir {
-    EXT2FUSE,
-    FUSE2EXT,
-}
+                    new_rec_len -= min_rec_len;
+                    buf_ptr = buf_ptr.add(min_rec_len);
+                }
 
-/* FUSE uses inode 1 for the root dir, ext2 uses inode 2. inode 1 in ext2 is the bad block inode */
-fn map_inode(dir: InodeMapDir, num: u64) -> u64 {
-    match dir {
-        InodeMapDir::EXT2FUSE => match num { 2 => 1, x => x },
-        InodeMapDir::FUSE2EXT => match num { 1 => 2, x => x },
-    }
-}
+                // fill new dirent
+                *(buf_ptr.offset(4) as *mut u16) = new_rec_len as u16;
+                *(buf_ptr.offset(6) as *mut u8) = target_name.len().try_into().unwrap();
 
-impl Filesystem for HelloFS {
-    fn init(&mut self, req: &Request) -> Result<(), c_int> {
-        println!("device: {:?}", self.device);
-        self.load_superblock()?;
+                let tgt_name_slice = target_name.as_bytes();
+                let name_buf = std::slice::from_raw_parts_mut(buf_ptr.offset(8), tgt_name_slice.len());
+                name_buf.copy_from_slice(tgt_name_slice);
+            }
 
-        Ok(())
-    }
-
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent = map_inode(InodeMapDir::FUSE2EXT, parent);
-        let name = try_option!(name.to_str(), reply, ENOENT);
-
-        println!("lookup: parent: {}, name: {}", parent, name);
-        let entries = try_error!(self.load_dir_entries(parent), reply);
-
-        let ent = entries.iter().find(|e| e.name == name);
-        let ent = try_option!(ent, reply, ENOENT);
-
-        let ino_num: u64 = ent.inode.into();
-
-        let inode = try_error!(self.load_inode(ino_num), reply);
-        let attr = inode2fuse(ino_num, inode);
-        reply.entry(&TTL, &attr, 0)
-    }
-
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
-
-        println!("getattr {}", ino);
-        let inode = try_error!(self.load_inode(ino), reply);
-
-        let attr = inode2fuse(ino, inode);
-        reply.attr(&TTL, &attr)
-    }
-
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
-        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
-
-
-        println!("read: ino: {}, offset: {}", ino, offset);
-        let buf = try_error!(self.load_from_blocks(ino, offset as usize, size), reply);
-
-        println!("read {}", String::from_utf8_lossy(&buf).to_string());
-        reply.data(&buf);
-    }
-
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let ino = map_inode(InodeMapDir::FUSE2EXT, ino);
-
-        println!("readdir: ino: {}, offset: {}", ino, offset);
-        let entries = try_error!(self.load_dir_entries(ino), reply);
-        for (i, ent) in entries.iter().enumerate().skip(offset as usize) {
-            reply.add(
-                map_inode(InodeMapDir::EXT2FUSE, ent.inode as u64),
-                (i + 1) as i64,
-                ent.filetype,
-                ent.name.clone()
-            );
+            // if opened_inode is not none, then we found a deleted inode. both new and deleted dirents
+            // need to set the inode and ft nums of the dirent
+            *(buf_ptr as *mut u32) = new_inode_num;
+            *(buf_ptr.offset(7) as *mut u8) = get_ext2_dirent_ft_from_kind(new_inode.get_kind().ok_or(EIO)?);
         }
 
-        reply.ok();
-    }
+        self.seek(alloc_buf_addr as u64)?;
+        self.device.write_all(&mut buf).map_err(|_| EIO)?;
 
-    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {
-        let parent = map_inode(InodeMapDir::FUSE2EXT, parent);
-        let name = try_option!(name.to_str(), reply, EINVAL);
-
-        println!("create: parent: {}, name: {}, mode {:o}", parent, name, mode);
-
-        try_error!(self.find_create_dir_ent(parent, name.to_string(), mode), reply);
-
+        Ok((new_inode_num, new_inode))
     }
 }
+
 
 fn main() {
     env_logger::init();
