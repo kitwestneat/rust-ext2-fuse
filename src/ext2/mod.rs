@@ -1,12 +1,13 @@
-use std::cmp;
-use std::mem::{size_of};
+use core::cmp;
+use core::mem::{size_of};
+use core::convert::TryInto;
+
 use libc::{c_int, ENOENT, EIO, ENOTDIR, ENOSPC};
 use std::time::SystemTime;
-use std::convert::TryInto;
-
 use fuse::{FileType};
 
-use crate::device::Device;
+use crate::device::{Device,DeviceData};
+use crate::device_data_type;
 
 mod filesystem;
 
@@ -222,11 +223,78 @@ impl <'a> InodeBlockIterator<'a> {
             triple_indirect_block_page: Vec::new(),
         }
     }
+
+    fn load_caches(&mut self, offsets: &[usize]) {
+        match offsets {
+            &[_indirect_offset] => {
+                println!("using indirect blocks");
+                if self.indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.block[INDIRECT_BLOCK_INDEX], &mut self.indirect_block_page).unwrap();
+                }
+            },
+            &[indirect_offset, double_indirect_offset] => {
+                if self.double_indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.block[DOUBLE_INDIRECT_BLOCK_INDEX], &mut self.double_indirect_block_page).unwrap();
+                }
+                if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page).unwrap();
+                }
+            },
+            &[indirect_offset, double_indirect_offset, triple_indirect_offset] => {
+                if self.triple_indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.block[TRIPLE_INDIRECT_BLOCK_INDEX], &mut self.triple_indirect_block_page).unwrap();
+                }
+                if double_indirect_offset == 0 || self.double_indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.triple_indirect_block_page[triple_indirect_offset], &mut self.double_indirect_block_page).unwrap();
+                }
+                if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
+                    self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page).unwrap();
+                }
+            }
+            _ => { println!("unexpected offsets: {:?}", offsets) },
+        }
+    }
 }
 
 const INDIRECT_BLOCK_INDEX: usize = 12;
 const DOUBLE_INDIRECT_BLOCK_INDEX: usize = 13;
 const TRIPLE_INDIRECT_BLOCK_INDEX: usize = 14;
+
+fn get_indirect_offsets_for_block_offset<'a>(block_size: usize, block_offset: u32) -> Vec<usize> {
+    let mut indirect_offset: usize = block_offset as usize - INDIRECT_BLOCK_INDEX as usize;
+
+    let page_blocks = block_size / size_of::<u32>();
+    if indirect_offset < page_blocks {
+        return vec![indirect_offset];
+    }
+
+    indirect_offset -= page_blocks;
+
+    let double_page_blocks = page_blocks * page_blocks;
+    if indirect_offset < double_page_blocks {
+        let single_indirect_offset = indirect_offset % page_blocks;
+        let double_indirect_offset = indirect_offset / page_blocks;
+
+        return vec![single_indirect_offset, double_indirect_offset];
+    }
+
+    indirect_offset -= double_page_blocks;
+
+    // each triple indirect record points to 1 DPB worth of blocks
+    let triple_indirect_offset = indirect_offset / double_page_blocks;
+
+    // find the number of blocks into the DPB the block offset is. 
+    let dpb_offset = indirect_offset % double_page_blocks;
+
+    // each double indirect block addresses a page_block worth of blocks
+    let double_indirect_offset = dpb_offset / page_blocks;
+
+    let single_indirect_offset = dpb_offset % page_blocks;
+
+    vec![single_indirect_offset,
+     double_indirect_offset,
+     triple_indirect_offset]
+}
 
 impl Iterator for InodeBlockIterator<'_> {
     type Item = u32;
@@ -236,68 +304,15 @@ impl Iterator for InodeBlockIterator<'_> {
         }
 
         // does this fit in direct blocks?
-        if self.block_offset < INDIRECT_BLOCK_INDEX  as u32 {
-            let ret = self.block[self.block_offset as usize];
+        let ret = if self.block_offset < INDIRECT_BLOCK_INDEX  as u32 {
+            self.block[self.block_offset as usize]
+        } else {
+            let offsets = get_indirect_offsets_for_block_offset(self.fs.block_size(), self.block_offset);
+            self.load_caches(&offsets);
 
-            self.block_offset += 1;
-            return Some(ret);
-        }
-
-        let page_blocks = self.fs.block_size() / size_of::<u32>();
-        let mut indirect_offset: usize = self.block_offset as usize - INDIRECT_BLOCK_INDEX as usize;
-
-        // does this fit in indirect blocks?
-        if indirect_offset < page_blocks {
-            println!("using indirect blocks");
-            if self.indirect_block_page.len() == 0 {
-                self.fs.load_block(self.block[INDIRECT_BLOCK_INDEX], &mut self.indirect_block_page).unwrap();
-            }
-            let ret = self.indirect_block_page[indirect_offset];
-
-            self.block_offset += 1;
-            return Some(ret);
-        }
-
-        indirect_offset -= page_blocks;
-
-        let double_page_blocks = page_blocks * page_blocks;
-
-        // does this fit in double indirect blocks?
-        if indirect_offset < double_page_blocks {
-            println!("using double indirect blocks");
-            let double_indirect_offset = indirect_offset / page_blocks;
-            indirect_offset = indirect_offset % page_blocks;
-
-            if self.double_indirect_block_page.len() == 0 {
-                self.fs.load_block(self.block[DOUBLE_INDIRECT_BLOCK_INDEX], &mut self.double_indirect_block_page).unwrap();
-            }
-            if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
-                self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page).unwrap();
-            }
-
-            let ret = self.indirect_block_page[indirect_offset];
-
-            self.block_offset += 1;
-            return Some(ret);
-        }
-
-        println!("using triple indirect blocks");
-        indirect_offset -= double_page_blocks;
-        let triple_indirect_offset = indirect_offset / double_page_blocks;
-        let double_indirect_offset = (indirect_offset % double_page_blocks) / page_blocks;
-        indirect_offset = (indirect_offset % double_indirect_offset) % page_blocks;
-
-        if self.triple_indirect_block_page.len() == 0 {
-            self.fs.load_block(self.block[TRIPLE_INDIRECT_BLOCK_INDEX], &mut self.triple_indirect_block_page).unwrap();
-        }
-        if double_indirect_offset == 0 || self.double_indirect_block_page.len() == 0 {
-            self.fs.load_block(self.triple_indirect_block_page[triple_indirect_offset], &mut self.double_indirect_block_page).unwrap();
-        }
-        if indirect_offset == 0 || self.indirect_block_page.len() == 0 {
-            self.fs.load_block(self.double_indirect_block_page[double_indirect_offset], &mut self.indirect_block_page).unwrap();
-        }
-
-        let ret = self.indirect_block_page[indirect_offset];
+            let indirect_offset = offsets[0];
+            self.indirect_block_page[indirect_offset]
+        };
 
         self.block_offset += 1;
         return Some(ret);
@@ -316,6 +331,10 @@ impl Iterator for InodeBlockIterator<'_> {
 }
 
 const SUPERBLOCK_ADDR: u64 = 1024;
+
+device_data_type!(Inode);
+device_data_type!(Superblock);
+device_data_type!(BlockGroupDescTable);
 
 impl HelloFS {
     pub fn new(device: Device) -> Self {
@@ -354,6 +373,75 @@ impl HelloFS {
         self.device.read_at(slice, addr)
     }
 
+    fn find_free_bgdt(&self, init_group_num: u32, getter: impl Fn(&BlockGroupDescTable) -> u16) -> Result<(u32, BlockGroupDescTable), c_int> {
+        let mut bgdt = self.load_bgdt(init_group_num)?;
+        let total_group_count = self.superblock.blocks_count / self.superblock.blocks_per_group;
+
+        let mut group_idx = init_group_num;
+        while getter(&bgdt) == 0 {
+            group_idx = (group_idx + 1) % total_group_count;
+            if group_idx == init_group_num {
+                return Err(ENOSPC);
+            }
+
+            bgdt = self.load_bgdt(group_idx)?;
+        }
+
+        Ok((group_idx, bgdt))
+    }
+
+    fn alloc_free_bit(&self, bitmap_block_num: u32) -> Result<u32, c_int> {
+        let mut buf: Vec<u8> = Vec::new();
+        self.load_block(bitmap_block_num, &mut buf)?;
+
+        // find open bit in bitmap
+        let mut table_num = 0;
+        for b in &mut buf {
+            println!("b[{:p}]={:x}", b, *b);
+            if *b == 0xff {
+                table_num += 8;
+                continue;
+            }
+            let mut byte = *b;
+
+            let mut shift = 0;
+            while byte & 0x1 != 0 {
+                byte = byte >> 1;
+                shift += 1;
+            }
+
+            *b = *b | (1 << shift);
+            table_num += shift;
+
+            break;
+        }
+
+        println!("writing bitmap");
+        let bitmap_addr = self.block2addr(bitmap_block_num);
+        self.device.write_at(&buf, bitmap_addr)?;
+
+        Ok(table_num)
+    }
+
+    fn alloc_block(&mut self, ino: u64) -> Result<u32, c_int> {
+        if self.superblock.free_blocks_count == 0 {
+            return Err(ENOSPC);
+        }
+        let (group_num, _) = self.get_inode_group_info(ino);
+
+        let (group_idx, mut bgdt) = self.find_free_bgdt(group_num as u32, |bgdt| bgdt.free_blocks_count)?;
+        let block_table_num = self.alloc_free_bit(bgdt.block_bitmap)?;
+
+        bgdt.free_blocks_count -= 1;
+        self.store_bgdt(group_idx, &bgdt)?;
+        self.superblock.free_blocks_count -= 1;
+        self.store_superblock()?;
+
+        let block_num = group_idx * self.superblock.blocks_per_group + block_table_num + 1;
+
+        Ok(block_num)
+    }
+
     fn get_inode_blocks<'a>(&'a self, inode: &'a Inode) -> InodeBlockIterator<'a> {
         InodeBlockIterator::new(inode, self)
     }
@@ -387,15 +475,15 @@ impl HelloFS {
     }
 
     // XXX should it load the entire BGDT block or just the table for the given block group?
-    fn load_bgdt(&mut self, group_num: u32) -> Result<Box<BlockGroupDescTable>, c_int> {
+    fn load_bgdt(&self, group_num: u32) -> Result<BlockGroupDescTable, c_int> {
         let bgdt_block = self.superblock.first_data_block + BGDT_OFFSET;
         let bgdt_addr = self.block2addr(bgdt_block) + ((group_num as u64)*size_of::<BlockGroupDescTable>() as u64);
 
-        self.device.load(bgdt_addr)
+        Ok(*(self.device.load(bgdt_addr)?))
     }
 
     // XXX should store backup blocks too
-    fn store_bgdt(&mut self, group_num: u32, bgdt: &BlockGroupDescTable) -> Result<(), c_int> {
+    fn store_bgdt(&self, group_num: u32, bgdt: &BlockGroupDescTable) -> Result<(), c_int> {
         let bgdt_block = self.superblock.first_data_block + BGDT_OFFSET;
         let bgdt_addr = self.block2addr(bgdt_block) + ((group_num as u64)*size_of::<BlockGroupDescTable>() as u64);
 
@@ -441,59 +529,17 @@ impl HelloFS {
 
     // try to allocate an inode close to the parent
     fn alloc_inode(&mut self, parent_ino: u64) -> Result<u32, c_int> {
+        if self.superblock.free_inodes_count == 0 {
+            return Err(ENOSPC);
+        }
+
         let (group_num, _) = self.get_inode_group_info(parent_ino);
 
-        let mut bgdt = self.load_bgdt(group_num as u32)?;
-        let total_group_count = self.superblock.blocks_count / self.superblock.blocks_per_group;
+        let (group_idx, mut bgdt) = self.find_free_bgdt(group_num as u32, |bgdt| bgdt.free_inodes_count)?;
+        let inode_table_num = self.alloc_free_bit(bgdt.inode_bitmap)?;
 
-        let mut group_idx = group_num as u32;
-        while bgdt.free_inodes_count == 0 {
-            group_idx = (group_idx + 1) % total_group_count;
-            if group_idx as u64 == group_num {
-                return Err(ENOSPC);
-            }
-
-            bgdt = self.load_bgdt(group_idx)?;
-        }
-
-        let mut buf: Vec<u8> = Vec::new();
-        println!("loading inode_bitmap into {:p}", &buf);
-
-        self.load_block(bgdt.inode_bitmap, &mut buf)?;
-        println!("loaded, new buf size: {}", buf.len());
-
-        // find open inode in bitmap
-        let mut inode_table_num = 0;
-        for b in &mut buf {
-            println!("b[{:p}]={:x}", b, *b);
-            if *b == 0xff {
-                inode_table_num += 8;
-                continue;
-            }
-            let mut byte = *b;
-
-            let mut shift = 0;
-            while byte & 0x1 != 0 {
-                byte = byte >> 1;
-                shift += 1;
-            }
-
-            println!("flipping bitmap: b: {:x} shift: {}, int: {}", *b, shift, inode_table_num);
-            *b = *b | (1 << shift);
-            inode_table_num += shift;
-
-            break;
-        }
-
-        println!("writing inode bitmap");
-        let bitmap_addr = self.block2addr(bgdt.inode_bitmap);
-        self.device.write_at(&buf, bitmap_addr)?;
-
-        println!("writing bgdt");
         bgdt.free_inodes_count -= 1;
         self.store_bgdt(group_idx, &bgdt)?;
-
-        println!("writing superblock");
         self.superblock.free_inodes_count -= 1;
         self.store_superblock()?;
 
@@ -502,6 +548,10 @@ impl HelloFS {
         println!("created inode {}, group_idx {}, inode_table_num {}", inode_num,group_idx, inode_table_num);
 
         Ok(inode_num)
+    }
+
+    fn append_block_to_inode(&self, inode: Inode, block_num: u32, new_size: u64) {
+        
     }
 
     fn load_from_blocks(&mut self, ino: u64, offset: usize, load_size: u32) -> Result<Vec<u8>, c_int> {

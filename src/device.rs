@@ -5,8 +5,12 @@ use std::io::{Read,Seek, SeekFrom, Write};
 use std::mem::{size_of};
 use std::sync::Mutex;
 
-trait Loadable {}
-trait Storable {}
+pub trait DeviceData {}
+
+#[macro_export]
+macro_rules! device_data_type {
+    ($t:ty) => { impl DeviceData for $t {} }
+}
 
 #[derive(Debug)]
 pub struct Device {
@@ -20,7 +24,7 @@ impl Device {
         })
     }
 
-    pub fn load<T>(&self, addr: u64) -> Result<Box<T>, c_int> {
+    pub fn load<T>(&self, addr: u64) -> Result<Box<T>, c_int> where T: DeviceData {
         let alloc_buf_len = size_of::<T>();
         let mut buf: Vec<u8> = Vec::with_capacity(alloc_buf_len);
         unsafe { buf.set_len(alloc_buf_len); }
@@ -37,8 +41,8 @@ impl Device {
         }
     }
 
-    pub fn load_in<T>(&self, obj: &mut T, addr: u64) -> Result<(), c_int> {
-        let buf: &mut [u8] = unsafe { 
+    pub fn load_in<T>(&self, obj: &mut T, addr: u64) -> Result<(), c_int> where T: DeviceData {
+        let buf: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut((obj as *mut _) as *mut u8, size_of::<T>())
         };
 
@@ -59,7 +63,7 @@ impl Device {
         Ok(())
     }
 
-    pub fn store<T>(&self, obj: &T, addr: u64) -> Result<(), c_int> {
+    pub fn store<T>(&self, obj: &T, addr: u64) -> Result<(), c_int> where T: DeviceData {
         let buf = unsafe {
             std::slice::from_raw_parts((obj as *const _) as *const u8, size_of::<T>())
         };
