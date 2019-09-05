@@ -260,7 +260,7 @@ const INDIRECT_BLOCK_INDEX: usize = 12;
 const DOUBLE_INDIRECT_BLOCK_INDEX: usize = 13;
 const TRIPLE_INDIRECT_BLOCK_INDEX: usize = 14;
 
-fn get_indirect_offsets_for_block_offset<'a>(block_size: usize, block_offset: u32) -> Vec<usize> {
+fn get_indirect_offsets_for_block_offset(block_size: usize, block_offset: u32) -> Vec<usize> {
     let mut indirect_offset: usize = block_offset as usize - INDIRECT_BLOCK_INDEX as usize;
 
     let page_blocks = block_size / size_of::<u32>();
@@ -371,6 +371,12 @@ impl HelloFS {
         let slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, load_size) };
 
         self.device.read_at(slice, addr)
+    }
+
+    fn store_block<T>(&self, block_no: u32, buf: *const T) -> Result<(), c_int> {
+        let block_addr = self.block2addr(block_no);
+
+        self.device.write_count_at(buf as *const _, block_addr, self.block_size())
     }
 
     fn find_free_bgdt(&self, init_group_num: u32, getter: impl Fn(&BlockGroupDescTable) -> u16) -> Result<(u32, BlockGroupDescTable), c_int> {
@@ -550,8 +556,85 @@ impl HelloFS {
         Ok(inode_num)
     }
 
-    fn append_block_to_inode(&self, inode: Inode, block_num: u32, new_size: u64) {
-        
+    fn append_block_to_inode(&mut self, ino: u64, inode: &mut Inode, block_num: u32, new_size: u64) -> Result<(), c_int> {
+        let block_size = self.block_size();
+        let element_count = block_size / size_of::<u32>();
+        let size = inode.get_size();
+        let end_block_offset = ALIGN!(UP, size / block_size, block_size);
+        let offsets: &[usize] = &get_indirect_offsets_for_block_offset(block_size, end_block_offset as u32 + 1);
+
+        match offsets {
+            &[indirect_offset] => {
+                let mut buf: Vec<u32> = Vec::new();
+
+                if inode.block[INDIRECT_BLOCK_INDEX] == 0 {
+                    inode.block[INDIRECT_BLOCK_INDEX] = self.alloc_block(ino)?;
+                    self.store_inode(ino, &inode)?;
+                    buf.resize(element_count, 0); // fill new block with 0s
+                } else {
+                    self.load_block(inode.block[INDIRECT_BLOCK_INDEX], &mut buf)?;
+                }
+
+                buf[indirect_offset] = block_num;
+                self.store_block(inode.block[INDIRECT_BLOCK_INDEX], &buf)?;
+            },
+            &[indirect_offset, double_indirect_offset] => {
+                let mut buf: Vec<u32> = Vec::new();
+                if inode.block[DOUBLE_INDIRECT_BLOCK_INDEX] == 0 {
+                    inode.block[DOUBLE_INDIRECT_BLOCK_INDEX] = self.alloc_block(ino)?;
+                    self.store_inode(ino, &inode)?;
+                    buf.resize(element_count, 0);
+                } else {
+                    self.load_block(inode.block[DOUBLE_INDIRECT_BLOCK_INDEX], &mut buf)?;
+                }
+
+                if buf[double_indirect_offset] == 0 {
+                    buf[double_indirect_offset] = self.alloc_block(ino)?;
+                    self.store_block(inode.block[DOUBLE_INDIRECT_BLOCK_INDEX], &buf)?;
+
+                    buf = vec![0; element_count];
+                } else {
+                    self.load_block(buf[double_indirect_offset], &mut buf)?;
+                }
+
+                buf[indirect_offset] = block_num;
+                self.store_block(buf[double_indirect_offset], &buf)?;
+            }
+            &[indirect_offset, double_indirect_offset, triple_indirect_offset] => {
+                let mut buf: Vec<u32> = Vec::new();
+                if inode.block[TRIPLE_INDIRECT_BLOCK_INDEX] == 0 {
+                    inode.block[TRIPLE_INDIRECT_BLOCK_INDEX] = self.alloc_block(ino)?;
+                    self.store_inode(ino, &inode)?;
+                    buf.resize(element_count, 0);
+                } else {
+                    self.load_block(inode.block[TRIPLE_INDIRECT_BLOCK_INDEX], &mut buf)?;
+                }
+
+                if buf[triple_indirect_offset] == 0 {
+                    buf[triple_indirect_offset] = self.alloc_block(ino)?;
+                    self.store_block(inode.block[TRIPLE_INDIRECT_BLOCK_INDEX], &buf)?;
+
+                    buf = vec![0; element_count];
+                } else {
+                    self.load_block(buf[triple_indirect_offset], &mut buf)?;
+                }
+
+                if buf[double_indirect_offset] == 0 {
+                    buf[double_indirect_offset] = self.alloc_block(ino)?;
+                    self.store_block(buf[triple_indirect_offset], &buf)?;
+
+                    buf = vec![0; element_count];
+                } else {
+                    self.load_block(buf[double_indirect_offset], &mut buf)?;
+                }
+
+                buf[indirect_offset] = block_num;
+                self.store_block(buf[double_indirect_offset], &buf)?;
+            }
+            _ => { println!("unexpected offsets: {:?}", offsets) },
+        }
+
+        Ok(())
     }
 
     fn load_from_blocks(&mut self, ino: u64, offset: usize, load_size: u32) -> Result<Vec<u8>, c_int> {

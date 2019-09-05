@@ -64,12 +64,9 @@ impl Device {
     }
 
     pub fn store<T>(&self, obj: &T, addr: u64) -> Result<(), c_int> where T: DeviceData {
-        let buf = unsafe {
-            std::slice::from_raw_parts((obj as *const _) as *const u8, size_of::<T>())
-        };
-
-        self.write_at(buf, addr)
+        self.write_count_at(obj as *const _, addr, size_of::<T>())
     }
+
     pub fn write_at(&self, buf: &[u8], addr: u64) ->Result<(), c_int> {
         let mut dev = self.file.lock().unwrap();
 
@@ -77,6 +74,14 @@ impl Device {
         dev.write_all(buf).map_err(|_| EIO)?;
 
         Ok(())
+    }
+
+    pub fn write_count_at<T>(&self, obj: *const T, addr: u64, count: usize) -> Result<(), c_int> {
+        let buf = unsafe {
+            std::slice::from_raw_parts(obj as *const u8, count)
+        };
+
+        self.write_at(buf, addr)
     }
 
     /*
